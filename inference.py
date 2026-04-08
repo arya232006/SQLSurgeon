@@ -2,11 +2,11 @@
 SQL Surgeon — Baseline Inference Script
 ========================================
 
-MANDATORY ENVIRONMENT VARIABLES:
-    API_BASE_URL         The API endpoint for the LLM (default: HF router)
-    MODEL_NAME           The model identifier (default: Qwen2.5-72B-Instruct)
-    HF_TOKEN             Your Hugging Face / API key
-    IMAGE_NAME           Docker image name for the environment
+ENVIRONMENT VARIABLES (submission checklist):
+    API_BASE_URL         LLM API endpoint — default set in code (optional override)
+    MODEL_NAME           Model id — default set in code (optional override)
+    HF_TOKEN             Hugging Face / API key — REQUIRED, no default (set in environment)
+    LOCAL_IMAGE_NAME     Optional — local Docker image when using from_docker_image()
 
 STDOUT FORMAT:
     [START] task=<task_name> env=<benchmark> model=<model_name>
@@ -25,11 +25,14 @@ from models import SqlSurgeonAction, SqlSurgeonActionType
 from client import SqlSurgeonEnv
 
 # ── Configuration ────────────────────────────────────────────────────────────
+# Defaults only for API_BASE_URL and MODEL_NAME — not for HF_TOKEN (per checklist).
 
-IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME") or os.getenv("IMAGE_NAME")
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
-API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
-MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
+IMAGE_NAME = LOCAL_IMAGE_NAME or os.getenv("IMAGE_NAME")
 
 BENCHMARK = "sql_surgeon"
 MAX_ACTIONS = 15 # Budget for tools + submission
@@ -168,7 +171,7 @@ async def run_task(client: OpenAI, env: SqlSurgeonEnv, task_id: str) -> float:
     return total_reward
 
 async def main() -> None:
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
     tasks_to_test = ["filter_scan", "index_trap", "semantics_hazard", "explain_deception"]
 
     for task_id in tasks_to_test:
@@ -244,4 +247,10 @@ async def main() -> None:
             print("-" * 40, flush=True)
 
 if __name__ == "__main__":
+    if not HF_TOKEN:
+        print(
+            "[ERROR] HF_TOKEN is required (no default). Set it in the environment before running.",
+            flush=True,
+        )
+        raise SystemExit(1)
     asyncio.run(main())
