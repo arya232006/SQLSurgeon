@@ -1,3 +1,12 @@
+---
+title: SQL Surgeon
+emoji: 🏥
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 8000
+---
+
 # 🏥 SQL Surgeon
 
 > **A real-world SQL query optimization environment for OpenEnv.**
