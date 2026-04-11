@@ -69,6 +69,13 @@ PRODUCT_NOUNS = [
 
 ORDER_STATUSES = ["pending", "processing", "shipped", "delivered", "cancelled"]
 
+# Dataset size (matches README e-commerce scale). Keeps POST /reset fast enough for
+# HF Spaces / hackathon proxies that time out around ~10–30s.
+N_CUSTOMERS = 10_000
+N_PRODUCTS = 1_000
+N_ORDERS = 100_000
+N_REVIEWS = 50_000
+
 
 SCHEMA_DDL = """
 CREATE TABLE IF NOT EXISTS customers (
@@ -155,9 +162,14 @@ class DatabaseManager:
         # OperationalError on Linux containers and break POST /reset.
         self.conn.execute("PRAGMA journal_mode=MEMORY")
         self.conn.execute("PRAGMA synchronous=OFF")
+        self.conn.execute("PRAGMA temp_store=MEMORY")
+        # Larger cache speeds bulk insert + first query after reset.
+        self.conn.execute("PRAGMA cache_size=-100000")
         self.conn.executescript(SCHEMA_DDL)
-        self.conn.executescript(ESSENTIAL_INDEXES)
+        # Build indexes after bulk load — much faster than inserting with indexes on.
         self._seed_data()
+        self.conn.executescript(ESSENTIAL_INDEXES)
+        self.conn.commit()
 
     def close(self) -> None:
         """Close the database connection."""
@@ -175,9 +187,9 @@ class DatabaseManager:
         assert self.conn is not None
         rng = self._rng
 
-        # ── Customers: 20,000 ──
+        # ── Customers ──
         customers = []
-        for i in range(1, 20_001):
+        for i in range(1, N_CUSTOMERS + 1):
             fname = rng.choice(FIRST_NAMES)
             lname = rng.choice(LAST_NAMES)
             city = rng.choice(CITIES)
@@ -195,9 +207,9 @@ class DatabaseManager:
             "INSERT INTO customers VALUES (?,?,?,?,?,?,?)", customers
         )
 
-        # ── Products: 1,000 ──
+        # ── Products ──
         products = []
-        for i in range(1, 1_001):
+        for i in range(1, N_PRODUCTS + 1):
             adj = rng.choice(PRODUCT_ADJECTIVES)
             noun = rng.choice(PRODUCT_NOUNS)
             cat = rng.choice(CATEGORIES)
@@ -208,11 +220,11 @@ class DatabaseManager:
             "INSERT INTO products VALUES (?,?,?,?,?)", products
         )
 
-        # ── Orders: 200,000 ──
+        # ── Orders ──
         orders = []
-        for i in range(1, 200_001):
-            cust_id = rng.randint(1, 20_000)
-            prod_id = rng.randint(1, 1_000)
+        for i in range(1, N_ORDERS + 1):
+            cust_id = rng.randint(1, N_CUSTOMERS)
+            prod_id = rng.randint(1, N_PRODUCTS)
             qty = rng.randint(1, 10)
             total = round(rng.uniform(10.0, 2000.0), 2)
             status = rng.choice(ORDER_STATUSES)
@@ -227,10 +239,10 @@ class DatabaseManager:
             "INSERT INTO orders VALUES (?,?,?,?,?,?,?)", orders
         )
 
-        # ── Reviews: 100,000 ──
+        # ── Reviews ──
         # Pull valid (order, customer, product) triplets from existing orders
         reviews = []
-        for i in range(1, 100_001):
+        for i in range(1, N_REVIEWS + 1):
             # Pick a random order from the generated
             order_record = orders[rng.randint(0, len(orders) - 1)]
             order_id = order_record[0]
@@ -249,8 +261,6 @@ class DatabaseManager:
         self.conn.executemany(
             "INSERT INTO reviews VALUES (?,?,?,?,?,?,?)", reviews
         )
-
-        self.conn.commit()
 
     def execute_query(
         self, query: str, timeout_seconds: float = 10.0
