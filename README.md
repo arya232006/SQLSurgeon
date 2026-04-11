@@ -191,7 +191,7 @@ with SqlSurgeonEnv(base_url="http://localhost:8000").sync() as env:
 
 ```bash
 # Build
-docker build -t sql-surgeon:latest -f server/Dockerfile .
+docker build -t sql-surgeon:latest .
 
 # Run
 docker run -p 8000:8000 sql-surgeon:latest
@@ -223,6 +223,7 @@ sql_surgeon/
 ├── client.py                       # SqlSurgeonEnv client
 ├── inference.py                    # Baseline inference script
 ├── openenv.yaml                    # OpenEnv manifest
+├── Dockerfile                      # Container definition (required at root for HF Spaces)
 ├── pyproject.toml                  # Dependencies
 ├── README.md                       # This file
 ├── .dockerignore                   # Docker exclusions
@@ -233,8 +234,7 @@ sql_surgeon/
     ├── database.py                 # SQLite setup + query execution
     ├── tasks.py                    # 7 optimization tasks (easy -> expert)
     ├── graders.py                  # Deterministic grading logic
-    ├── requirements.txt            # Server dependencies
-    └── Dockerfile                  # Container definition
+    └── requirements.txt            # Server dependencies
 └── scripts/
     └── validate-submission.sh      # Pre-submission validator
 ```
