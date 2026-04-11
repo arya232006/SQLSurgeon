@@ -36,23 +36,38 @@ class SqlSurgeonEnv(EnvClient[SqlSurgeonAction, SqlSurgeonObservation, SqlSurgeo
         }
 
     def _parse_result(self, payload: dict) -> StepResult[SqlSurgeonObservation]:
-        metadata = payload.get("metadata", {})
+        # Wire format: { "observation": { ...typed fields... }, "reward", "done" }.
+        # `metadata` is omitted from JSON by OpenEnv's serializer; fields live under "observation".
+        inner = dict(payload.get("observation") or {})
+        extra = payload.get("metadata")
+        if isinstance(extra, dict):
+            inner = {**inner, **extra}
+        dh = inner.get("deceptive_hints", [])
+        if not isinstance(dh, list):
+            dh = []
+        hi = inner.get("hallucination_info")
+        if hi is not None and not isinstance(hi, dict):
+            hi = None
         obs = SqlSurgeonObservation(
-            task_id=metadata.get("task_id", ""),
-            task_description=metadata.get("task_description", ""),
-            original_query=metadata.get("original_query", ""),
-            schema_ddl=metadata.get("schema_ddl", ""),
-            sample_data=metadata.get("sample_data", ""),
-            query_plan_original=metadata.get("query_plan_original", ""),
-            execution_time_original_ms=metadata.get("execution_time_original_ms", 0.0),
-            expected_row_count=metadata.get("expected_row_count", 0),
-            last_error=metadata.get("error"),
-            last_execution_time_ms=metadata.get("execution_time_optimized_ms", 0.0),
-            last_speedup=metadata.get("speedup", 0.0),
-            last_correctness=metadata.get("is_correct", False),
-            actions_remaining=metadata.get("actions_remaining", 0),
-            attempts_remaining=metadata.get("actions_remaining", 0),
-            best_speedup_so_far=metadata.get("best_speedup_so_far", 0.0),
+            metadata=inner,
+            task_id=str(inner.get("task_id", "")),
+            task_description=str(inner.get("task_description", "")),
+            original_query=str(inner.get("original_query", "")),
+            schema_ddl=str(inner.get("schema_ddl", "")),
+            sample_data=str(inner.get("sample_data", "")),
+            query_plan_original=str(inner.get("query_plan_original", "")),
+            execution_time_original_ms=float(inner.get("execution_time_original_ms", 0.0)),
+            expected_row_count=int(inner.get("expected_row_count", 0)),
+            deceptive_hints=dh,
+            tool_result=inner.get("tool_result"),
+            last_error=inner.get("error"),
+            last_execution_time_ms=float(inner.get("execution_time_optimized_ms", 0.0)),
+            last_speedup=float(inner.get("speedup", 0.0)),
+            last_correctness=bool(inner.get("is_correct", False)),
+            hallucination_info=hi,
+            actions_remaining=int(inner.get("actions_remaining", 0)),
+            attempts_remaining=int(inner.get("actions_remaining", 0)),
+            best_speedup_so_far=float(inner.get("best_speedup_so_far", 0.0)),
         )
         return StepResult(
             observation=obs,

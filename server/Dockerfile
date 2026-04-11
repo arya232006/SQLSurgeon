@@ -1,4 +1,4 @@
-# SQL Surgeon — Dockerfile
+# SQL Surgeon — Dockerfile (alternate path for tooling that expects server/Dockerfile)
 # Builds a lightweight container with SQLite + FastAPI server
 #
 # Build:  docker build -t sql-surgeon:latest -f server/Dockerfile .

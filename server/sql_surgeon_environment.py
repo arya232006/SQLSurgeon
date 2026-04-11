@@ -76,13 +76,15 @@ class SqlSurgeonEnvironment(Environment):
         )
         self._current_task: Optional[Task] = None
         self._original_result = None
+        self._query_plan_original_cached: str = ""
+        self._sample_data_cached: str = ""
 
     def reset(
         self,
         seed: Optional[int] = None,
         episode_id: Optional[str] = None,
         **kwargs: Any,
-    ) -> Observation:
+    ) -> SqlSurgeonObservation:
         """
         Reset the environment and load deceptive context.
         """
@@ -98,6 +100,8 @@ class SqlSurgeonEnvironment(Environment):
         )
         query_plan = self._db.get_query_plan(self._current_task.slow_query)
         sample_data = self._db.get_sample_data(limit=5)
+        self._query_plan_original_cached = query_plan
+        self._sample_data_cached = sample_data
 
         # Initialize research-grade state
         self._state = SqlSurgeonState(
@@ -116,24 +120,40 @@ class SqlSurgeonEnvironment(Environment):
             attempt_history=[],
         )
 
-        return Observation(
+        exec_ms = round(self._original_result.execution_time_ms, 3)
+        row_count = self._original_result.row_count
+        meta = {
+            "task_id": task_id,
+            "task_description": self._current_task.description,
+            "task_difficulty": self._current_task.difficulty,
+            "task_title": self._current_task.title,
+            "original_query": self._current_task.slow_query,
+            "schema_ddl": SCHEMA_DDL,
+            "sample_data": sample_data,
+            "query_plan_original": query_plan,
+            "deceptive_hints": self._current_task.deceptive_signals,
+            "execution_time_original_ms": exec_ms,
+            "expected_row_count": row_count,
+            "actions_remaining": 15,
+            "status": "ready",
+        }
+        # Top-level SqlSurgeonObservation fields are required: OpenEnv's HTTP serializer
+        # omits `metadata` from the JSON body, so task context must live on typed fields.
+        return SqlSurgeonObservation(
             done=False,
             reward=0.0,
-            metadata={
-                "task_id": task_id,
-                "task_description": self._current_task.description,
-                "task_difficulty": self._current_task.difficulty,
-                "task_title": self._current_task.title,
-                "original_query": self._current_task.slow_query,
-                "schema_ddl": SCHEMA_DDL,
-                "sample_data": sample_data,
-                "query_plan_original": query_plan,
-                "deceptive_hints": self._current_task.deceptive_signals,
-                "execution_time_original_ms": round(self._original_result.execution_time_ms, 3),
-                "expected_row_count": self._original_result.row_count,
-                "actions_remaining": 15,
-                "status": "ready",
-            },
+            metadata=meta,
+            task_id=task_id,
+            task_description=self._current_task.description,
+            original_query=self._current_task.slow_query,
+            schema_ddl=SCHEMA_DDL,
+            sample_data=sample_data,
+            query_plan_original=query_plan,
+            execution_time_original_ms=exec_ms,
+            expected_row_count=row_count,
+            deceptive_hints=list(self._current_task.deceptive_signals),
+            actions_remaining=15,
+            attempts_remaining=15,
         )
 
     def step(
@@ -141,7 +161,7 @@ class SqlSurgeonEnvironment(Environment):
         action: Any,
         timeout_s: Optional[float] = None,
         **kwargs: Any,
-    ) -> Observation:
+    ) -> SqlSurgeonObservation:
         """
         Execute an action (Tool call or Submission).
         """
@@ -162,7 +182,12 @@ class SqlSurgeonEnvironment(Environment):
             thoughts = getattr(action, "thoughts", "")
 
         if not self._current_task:
-            return Observation(done=True, reward=0.0, metadata={"error": "No task loaded"})
+            return SqlSurgeonObservation(
+                done=True,
+                reward=0.0,
+                metadata={"error": "No task loaded"},
+                last_error="No task loaded",
+            )
 
         # Branch based on Action Type
         from models import SqlSurgeonActionType
@@ -224,10 +249,45 @@ class SqlSurgeonEnvironment(Environment):
         metadata["tool_result"] = tool_result
         metadata["cumulative_reward"] = round(self._state.cumulative_reward, 3)
 
-        return Observation(
+        full_meta = {
+            **metadata,
+            "task_description": self._current_task.description,
+            "original_query": self._current_task.slow_query,
+            "schema_ddl": SCHEMA_DDL,
+            "sample_data": self._sample_data_cached,
+            "query_plan_original": self._query_plan_original_cached,
+            "deceptive_hints": self._current_task.deceptive_signals,
+            "execution_time_original_ms": round(self._original_result.execution_time_ms, 3)
+            if self._original_result
+            else 0.0,
+            "expected_row_count": self._original_result.row_count
+            if self._original_result
+            else 0,
+        }
+        return SqlSurgeonObservation(
             done=done,
             reward=reward,
-            metadata=metadata
+            metadata=full_meta,
+            task_id=self._state.task_id,
+            task_description=self._current_task.description,
+            original_query=self._current_task.slow_query,
+            schema_ddl=SCHEMA_DDL,
+            sample_data=self._sample_data_cached,
+            query_plan_original=self._query_plan_original_cached,
+            execution_time_original_ms=round(self._original_result.execution_time_ms, 3)
+            if self._original_result
+            else 0.0,
+            expected_row_count=self._original_result.row_count if self._original_result else 0,
+            deceptive_hints=list(self._current_task.deceptive_signals),
+            tool_result=tool_result,
+            last_error=metadata.get("error"),
+            last_speedup=float(metadata.get("speedup", 0.0)),
+            last_correctness=bool(metadata.get("is_correct", False)),
+            hallucination_info=metadata.get("hallucination_info")
+            if isinstance(metadata.get("hallucination_info"), dict)
+            else None,
+            actions_remaining=int(metadata.get("actions_remaining", 0)),
+            attempts_remaining=int(metadata.get("actions_remaining", 0)),
         )
 
     @property
