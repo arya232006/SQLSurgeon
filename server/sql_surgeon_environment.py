@@ -58,7 +58,9 @@ class SqlSurgeonEnvironment(Environment):
     def __init__(self) -> None:
         super().__init__()
         self._db = DatabaseManager(seed=42)
-        self._db.initialize()
+        # Do not seed here: OpenEnv's HTTP /reset constructs a new env then calls
+        # reset(), which already re-seeds the DB. Seeding in __init__ doubled work
+        # and often exceeded proxy timeouts on HF / hackathon checks.
         self._state = SqlSurgeonState(
             episode_id=str(uuid4()),
             step_count=0,

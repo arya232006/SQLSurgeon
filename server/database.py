@@ -151,7 +151,9 @@ class DatabaseManager:
     def initialize(self) -> None:
         """Create a fresh in-memory database and seed with data."""
         self.conn = sqlite3.connect(":memory:")
-        self.conn.execute("PRAGMA journal_mode=WAL")
+        # WAL is not valid for :memory: databases (SQLite); using it can raise
+        # OperationalError on Linux containers and break POST /reset.
+        self.conn.execute("PRAGMA journal_mode=MEMORY")
         self.conn.execute("PRAGMA synchronous=OFF")
         self.conn.executescript(SCHEMA_DDL)
         self.conn.executescript(ESSENTIAL_INDEXES)
