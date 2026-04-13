@@ -137,6 +137,11 @@ RELIABILITY RULES:
 3. SEMANTIC ERRORS (Hallucinations) carry a severe -1.0 penalty and end the episode.
 4. You must provide a 'confidence' score (0.0 to 1.0) for every 'submit' action.
 
+WORKFLOW (mandatory):
+- Right after "TASK LOADED", your FIRST reply MUST be action_type "schema" (empty query). Do not use "think" as the first action.
+- Use "explain" with a candidate query before you "submit".
+- Use "think" at most once between real tools; never burn all steps on "think".
+
 OUTPUT FORMAT:
 Reply with exactly one JSON object (no markdown heading required). Use snake_case keys:
   "action_type": "schema" | "explain" | "think" | "submit",
@@ -385,6 +390,13 @@ async def get_next_action(client: OpenAI, history: List[Dict]) -> Dict:
         if isinstance(parsed, dict):
             normalized = _normalize_parsed_action(parsed)
             if normalized is not None:
+                if INFERENCE_DEBUG:
+                    at = normalized.get("action_type")
+                    print(
+                        f"[DEBUG] parsed ok action_type={at!r} "
+                        f"query_len={len(str(normalized.get('query') or ''))}",
+                        flush=True,
+                    )
                 return normalized
 
         if INFERENCE_DEBUG:
