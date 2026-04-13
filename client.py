@@ -43,11 +43,14 @@ class SqlSurgeonEnv(EnvClient[SqlSurgeonAction, SqlSurgeonObservation, SqlSurgeo
     """
 
     def _step_payload(self, action: SqlSurgeonAction) -> dict:
+        action_type = action.action_type
+        if hasattr(action_type, "value"):
+            action_type = action_type.value
         return {
-            "action_type": action.action_type,
-            "query": action.query,
-            "thoughts": action.thoughts,
-            "confidence": action.confidence,
+            "action_type": str(action_type),
+            "query": str(action.query or ""),
+            "thoughts": str(action.thoughts or ""),
+            "confidence": float(action.confidence),
         }
 
     def _parse_result(self, payload: dict) -> StepResult:
