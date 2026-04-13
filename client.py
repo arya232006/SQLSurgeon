@@ -5,6 +5,8 @@ Provides the EnvClient subclass for connecting to a running
 SQL Surgeon environment server.
 """
 
+from dataclasses import dataclass
+
 from openenv.core import EnvClient
 try:
     # Older OpenEnv versions
@@ -14,8 +16,11 @@ except Exception:
         # Newer OpenEnv versions
         from openenv.core.types import StepResult
     except Exception:
-        # Fallback for type hints only; runtime behavior remains unchanged
-        from typing import Any as StepResult
+        @dataclass
+        class StepResult:
+            observation: object
+            reward: float = 0.0
+            done: bool = False
 from models import SqlSurgeonAction, SqlSurgeonObservation, SqlSurgeonState
 
 
