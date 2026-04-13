@@ -7,6 +7,7 @@ ENVIRONMENT VARIABLES (submission checklist):
     MODEL_NAME           Model id — default set in code (optional override)
     HF_TOKEN             Hugging Face / API key — REQUIRED, no default (set in environment)
     LOCAL_IMAGE_NAME     Optional — local Docker image when using from_docker_image()
+    INFERENCE_DEBUG      Optional — set to 1 to log LLM parse failures and empty responses
 
 STDOUT FORMAT:
     [START] task=<task_name> env=<benchmark> model=<model_name>
@@ -35,6 +36,7 @@ LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 IMAGE_NAME = LOCAL_IMAGE_NAME or os.getenv("IMAGE_NAME")
 SPACE_BASE_URL = os.getenv("SPACE_BASE_URL", "").strip()
 ENV_MODE = os.getenv("ENV_MODE", "auto").strip().lower()
+INFERENCE_DEBUG = os.getenv("INFERENCE_DEBUG", "").strip().lower() in ("1", "true", "yes")
 
 BENCHMARK = "sql_surgeon"
 MAX_ACTIONS = 15 # Budget for tools + submission
@@ -134,16 +136,88 @@ RELIABILITY RULES:
 4. You must provide a 'confidence' score (0.0 to 1.0) for every 'submit' action.
 
 OUTPUT FORMAT:
-Your response must contain a single JSON block wrapped in [START] and [END] markers:
-[START]
-{
+Reply with exactly one JSON object (no markdown heading required). Use snake_case keys:
   "action_type": "schema" | "explain" | "think" | "submit",
-  "query": "SELECT ...",
-  "thoughts": "Your detailed reasoning here...",
-  "confidence": 0.95
-}
-[END]
+  "query": "SELECT ..." (required for explain and submit),
+  "thoughts": "..." (for think),
+  "confidence": 0.0-1.0 (for submit).
+
+You may wrap the object in [START]...[END] or in a ```json code block if you prefer.
 """
+
+
+def _completion_text(message: Any) -> str:
+    """Normalize `message.content` from the OpenAI-compatible API (str or content parts)."""
+    raw = getattr(message, "content", None)
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list):
+        chunks: List[str] = []
+        for part in raw:
+            if isinstance(part, dict):
+                t = part.get("text")
+                if isinstance(t, str):
+                    chunks.append(t)
+                elif isinstance(part.get("content"), str):
+                    chunks.append(part["content"])
+            elif isinstance(part, str):
+                chunks.append(part)
+        return "".join(chunks)
+    return str(raw)
+
+
+def _normalize_parsed_action(parsed: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Map varied LLM JSON shapes to our SqlSurgeonAction fields.
+
+    Models often emit camelCase (`actionType`), nest under `action`, or use synonyms.
+    """
+    if not isinstance(parsed, dict):
+        return None
+
+    merged: Dict[str, Any] = {**parsed}
+    inner = merged.get("action")
+    if isinstance(inner, dict):
+        merged = {**inner, **{k: v for k, v in merged.items() if k != "action"}}
+
+    raw_type = (
+        merged.get("action_type")
+        or merged.get("actionType")
+        or merged.get("tool")
+        or merged.get("type")
+    )
+    if raw_type is None:
+        return None
+    if not isinstance(raw_type, str):
+        return None
+
+    t = raw_type.strip().lower().replace("-", "_")
+    aliases = {
+        "run_explain": "explain",
+        "explain_query": "explain",
+        "check_schema": "schema",
+        "get_schema": "schema",
+        "schema_tool": "schema",
+        "reasoning": "think",
+        "reason": "think",
+        "reflection": "think",
+        "final_submit": "submit",
+        "answer": "submit",
+    }
+    t = aliases.get(t, t)
+    merged["action_type"] = t
+
+    # Common alternate field names for SQL text
+    if not merged.get("query"):
+        for key in ("sql", "optimized_query", "optimizedQuery", "statement"):
+            v = merged.get(key)
+            if isinstance(v, str) and v.strip():
+                merged["query"] = v
+                break
+
+    return merged
 
 
 def _parse_action_from_llm_text(content: str) -> Optional[Dict[str, Any]]:
@@ -183,6 +257,23 @@ def _parse_action_from_llm_text(content: str) -> Optional[Dict[str, Any]]:
                         return json.loads(text[start : i + 1])
                     except json.JSONDecodeError:
                         break
+
+    # Single-line or whole-message JSON object / array
+    stripped = text.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            blob = json.loads(stripped)
+            if isinstance(blob, list):
+                for item in blob:
+                    if isinstance(item, dict):
+                        norm = _normalize_parsed_action(item)
+                        if norm is not None:
+                            return norm
+                return None
+            if isinstance(blob, dict):
+                return blob
+        except json.JSONDecodeError:
+            pass
     return None
 
 
@@ -195,11 +286,22 @@ async def get_next_action(client: OpenAI, history: List[Dict]) -> Dict:
             temperature=TEMPERATURE,
             max_tokens=2048,
         )
-        content = completion.choices[0].message.content or ""
+        message = completion.choices[0].message
+        content = _completion_text(message)
+
+        if INFERENCE_DEBUG and not content.strip():
+            fr = getattr(completion.choices[0], "finish_reason", None)
+            print(f"[DEBUG] Empty LLM content finish_reason={fr!r}", flush=True)
 
         parsed = _parse_action_from_llm_text(content)
-        if isinstance(parsed, dict) and parsed.get("action_type") is not None:
-            return parsed
+        if isinstance(parsed, dict):
+            normalized = _normalize_parsed_action(parsed)
+            if normalized is not None:
+                return normalized
+
+        if INFERENCE_DEBUG:
+            preview = content[:1200].replace("\n", "\\n")
+            print(f"[DEBUG] Parse failed; content preview: {preview!r}", flush=True)
 
         # Fallback to think if format is wrong
         return {
@@ -233,13 +335,18 @@ async def run_task(client: OpenAI, env: SqlSurgeonEnv, task_id: str) -> float:
             
             action_dict = await get_next_action(client, history)
             action_type = action_dict.get("action_type", "think")
-            
+            action_enum = (
+                SqlSurgeonActionType(action_type)
+                if action_type in [a.value for a in SqlSurgeonActionType]
+                else SqlSurgeonActionType.THINK
+            )
+
             # Map action_dict to SqlSurgeonAction
             action = SqlSurgeonAction(
-                action_type=SqlSurgeonActionType(action_type),
+                action_type=action_enum,
                 query=action_dict.get("query", ""),
                 thoughts=action_dict.get("thoughts", ""),
-                confidence=float(action_dict.get("confidence", 1.0))
+                confidence=float(action_dict.get("confidence", 1.0)),
             )
 
             response = await env.step(action)
@@ -249,16 +356,16 @@ async def run_task(client: OpenAI, env: SqlSurgeonEnv, task_id: str) -> float:
             done = response.done
             final_obs_metadata = obs.metadata
             
-            action_str = action_dict.get("query") or action_type
+            action_str = action_dict.get("query") or action_enum.value
             action_str = str(action_str).replace("\n", " ").strip()[:200]
             log_step(step, action_str, reward, done, final_obs_metadata.get("error"))
             rewards.append(reward)
             
             # Form next prompt with tool results or feedback
-            if action_type == "submit":
+            if action_enum == SqlSurgeonActionType.SUBMIT:
                 prompt = f"Submission result: {final_obs_metadata}"
             else:
-                prompt = f"Tool result for {action_type}: {final_obs_metadata.get('tool_result')}"
+                prompt = f"Tool result for {action_enum.value}: {final_obs_metadata.get('tool_result')}"
             
             history.append({"role": "assistant", "content": f"[START]{json.dumps(action_dict)}[END]"})
 
