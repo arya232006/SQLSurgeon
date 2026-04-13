@@ -41,6 +41,28 @@ MAX_ACTIONS = 15 # Budget for tools + submission
 TEMPERATURE = 0.1
 
 
+def log_remote_action_schema(base_url: str) -> None:
+    """Print action JSON-schema field names from the running Space (debugging deploy mismatches)."""
+    try:
+        import requests
+
+        url = base_url.rstrip("/") + "/metadata"
+        r = requests.get(url, timeout=45)
+        r.raise_for_status()
+        data = r.json()
+        action = data.get("action") or {}
+        props = sorted((action.get("properties") or {}).keys())
+        print(f"[REMOTE] {url} action.properties keys: {props}", flush=True)
+        if props == ["metadata"]:
+            print(
+                "[REMOTE] Server still registers generic Action (metadata-only). "
+                "Redeploy with server/app.py using SqlSurgeonAction.",
+                flush=True,
+            )
+    except Exception as e:
+        print(f"[REMOTE] Could not fetch schema ({e})", flush=True)
+
+
 async def create_environment() -> SqlSurgeonEnv:
     """
     Create an environment client from HF Space or local Docker image.
@@ -205,6 +227,9 @@ async def run_task(client: OpenAI, env: SqlSurgeonEnv, task_id: str) -> float:
     return total_reward
 
 async def main() -> None:
+    if SPACE_BASE_URL:
+        log_remote_action_schema(SPACE_BASE_URL)
+
     client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
     tasks_to_test = ["filter_scan", "index_trap", "semantics_hazard", "explain_deception"]
 

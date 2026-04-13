@@ -6,6 +6,7 @@ SQL Surgeon environment server.
 """
 
 from dataclasses import dataclass
+from typing import Any, Dict
 
 from openenv.core import EnvClient
 try:
@@ -103,6 +104,19 @@ class SqlSurgeonEnv(EnvClient[SqlSurgeonAction, SqlSurgeonObservation, SqlSurgeo
             best_speedup=payload.get("best_speedup", 0.0),
             cumulative_reward=payload.get("cumulative_reward", 0.0),
         )
+
+    async def _send_and_receive(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """Same as EnvClient, but include Pydantic `errors` from the server when present."""
+        await self._send(message)
+        response = await self._receive()
+        if response.get("type") == "error":
+            error_data = response.get("data", {}) or {}
+            code = error_data.get("code", "UNKNOWN")
+            msg = error_data.get("message", "Unknown error")
+            errors = error_data.get("errors")
+            suffix = f" pydantic_errors={errors!r}" if errors is not None else ""
+            raise RuntimeError(f"Server error: {msg} (code: {code}){suffix}")
+        return response
 
     async def step(self, action: SqlSurgeonAction, **kwargs):
         """
