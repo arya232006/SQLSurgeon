@@ -8,6 +8,7 @@ ENVIRONMENT VARIABLES (submission checklist):
     HF_TOKEN             Hugging Face / API key — REQUIRED, no default (set in environment)
     LOCAL_IMAGE_NAME     Optional — local Docker image when using from_docker_image()
     INFERENCE_DEBUG      Optional — set to 1 to log LLM parse failures and empty responses
+    INFERENCE_JSON_MODE  Optional — set to 1 to request JSON object mode (OpenAI-compatible)
 
 STDOUT FORMAT:
     [START] task=<task_name> env=<benchmark> model=<model_name>
@@ -37,6 +38,7 @@ IMAGE_NAME = LOCAL_IMAGE_NAME or os.getenv("IMAGE_NAME")
 SPACE_BASE_URL = os.getenv("SPACE_BASE_URL", "").strip()
 ENV_MODE = os.getenv("ENV_MODE", "auto").strip().lower()
 INFERENCE_DEBUG = os.getenv("INFERENCE_DEBUG", "").strip().lower() in ("1", "true", "yes")
+INFERENCE_JSON_MODE = os.getenv("INFERENCE_JSON_MODE", "").strip().lower() in ("1", "true", "yes")
 
 BENCHMARK = "sql_surgeon"
 MAX_ACTIONS = 15 # Budget for tools + submission
@@ -168,6 +170,79 @@ def _completion_text(message: Any) -> str:
     return str(raw)
 
 
+def _reasoning_extras(message: Any) -> str:
+    """Some HF / reasoning models put the visible answer in separate fields."""
+    bits: List[str] = []
+    for attr in (
+        "reasoning",
+        "reasoning_content",
+        "reasoningContent",
+        "thinking",
+    ):
+        v = getattr(message, attr, None)
+        if isinstance(v, str) and v.strip():
+            bits.append(v.strip())
+    return "\n".join(bits)
+
+
+def _all_assistant_text(message: Any) -> str:
+    """Content + reasoning fields (order: main content first, then reasoning tails)."""
+    main = _completion_text(message).strip()
+    extra = _reasoning_extras(message).strip()
+    if main and extra:
+        return f"{main}\n{extra}"
+    return main or extra
+
+
+def _strip_thinking_markers(text: str) -> str:
+    """Drop common reasoning wrappers so JSON scanners see the action object."""
+    t = text
+    t = re.sub(r"<redacted_thinking>[\s\S]*?</redacted_thinking>", "", t, flags=re.IGNORECASE)
+    _think_o = chr(60) + "think" + chr(62)
+    _think_c = "</" + "think" + ">"
+    t = re.sub(
+        re.escape(_think_o) + r"[\s\S]*?" + re.escape(_think_c),
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+    t = re.sub(r"```\s*thinking\s*[\s\S]*?```", "", t, flags=re.IGNORECASE)
+    return t.strip()
+
+
+def _after_last_closer(text: str, closer: str) -> Optional[str]:
+    idx = text.lower().rfind(closer.lower())
+    if idx < 0:
+        return None
+    return text[idx + len(closer) :].strip()
+
+
+def _parse_candidates(text: str) -> List[str]:
+    """Try the full message, then tails after reasoning closers (JSON is usually last)."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    seen: List[str] = []
+
+    def add(s: str) -> None:
+        s = (s or "").strip()
+        if s and s not in seen:
+            seen.append(s)
+
+    add(text)
+    add(_strip_thinking_markers(text))
+    for closer in (
+        "</redacted_thinking>",
+        "</" + "think" + ">",
+        "`</redacted_thinking>`",
+        "`</redacted_thinking>`",
+    ):
+        tail = _after_last_closer(text, closer)
+        if tail:
+            add(_strip_thinking_markers(tail))
+    return seen
+
+
 def _normalize_parsed_action(parsed: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Map varied LLM JSON shapes to our SqlSurgeonAction fields.
@@ -190,6 +265,8 @@ def _normalize_parsed_action(parsed: Dict[str, Any]) -> Optional[Dict[str, Any]]
     )
     if raw_type is None:
         return None
+    if isinstance(raw_type, (list, tuple)) and raw_type:
+        raw_type = raw_type[0]
     if not isinstance(raw_type, str):
         return None
 
@@ -220,13 +297,9 @@ def _normalize_parsed_action(parsed: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return merged
 
 
-def _parse_action_from_llm_text(content: str) -> Optional[Dict[str, Any]]:
-    """
-    Extract a JSON action object from model output.
-
-    Models often ignore [START]/[END] and return fenced ```json blocks or a bare object.
-    """
-    text = (content or "").strip()
+def _parse_action_segment(text: str) -> Optional[Dict[str, Any]]:
+    """Try to pull one JSON action object from a single candidate string."""
+    text = (text or "").strip()
     if not text:
         return None
 
@@ -258,7 +331,6 @@ def _parse_action_from_llm_text(content: str) -> Optional[Dict[str, Any]]:
                     except json.JSONDecodeError:
                         break
 
-    # Single-line or whole-message JSON object / array
     stripped = text.strip()
     if stripped.startswith("{") or stripped.startswith("["):
         try:
@@ -277,36 +349,51 @@ def _parse_action_from_llm_text(content: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _parse_action_from_llm_text(content: str) -> Optional[Dict[str, Any]]:
+    """
+    Extract a JSON action object from model output.
+
+    Tries stripped text, tails after reasoning tags, and each candidate segment.
+    """
+    for cand in _parse_candidates(content or ""):
+        got = _parse_action_segment(cand)
+        if got is not None:
+            return got
+    return None
+
+
 async def get_next_action(client: OpenAI, history: List[Dict]) -> Dict:
     """Call the LLM to get the next action in the multi-turn loop."""
     try:
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=history,
-            temperature=TEMPERATURE,
-            max_tokens=2048,
-        )
+        req: Dict[str, Any] = {
+            "model": MODEL_NAME,
+            "messages": history,
+            "temperature": TEMPERATURE,
+            "max_tokens": 2048,
+        }
+        if INFERENCE_JSON_MODE:
+            req["response_format"] = {"type": "json_object"}
+        completion = client.chat.completions.create(**req)
         message = completion.choices[0].message
-        content = _completion_text(message)
+        full_raw = _all_assistant_text(message)
 
-        if INFERENCE_DEBUG and not content.strip():
+        if INFERENCE_DEBUG and not full_raw.strip():
             fr = getattr(completion.choices[0], "finish_reason", None)
-            print(f"[DEBUG] Empty LLM content finish_reason={fr!r}", flush=True)
+            print(f"[DEBUG] Empty LLM text finish_reason={fr!r}", flush=True)
 
-        parsed = _parse_action_from_llm_text(content)
+        parsed = _parse_action_from_llm_text(full_raw)
         if isinstance(parsed, dict):
             normalized = _normalize_parsed_action(parsed)
             if normalized is not None:
                 return normalized
 
         if INFERENCE_DEBUG:
-            preview = content[:1200].replace("\n", "\\n")
-            print(f"[DEBUG] Parse failed; content preview: {preview!r}", flush=True)
+            preview = full_raw[:1200].replace("\n", "\\n")
+            print(f"[DEBUG] Parse failed; text preview: {preview!r}", flush=True)
 
-        # Fallback to think if format is wrong
         return {
             "action_type": "think",
-            "thoughts": f"Parsing error in LLM output: {content[:500]}",
+            "thoughts": f"Parsing error in LLM output: {full_raw[:500]}",
         }
     except Exception as e:
         return {"action_type": "think", "thoughts": f"Inference Error: {e}"}
