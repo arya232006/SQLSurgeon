@@ -33,10 +33,44 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 IMAGE_NAME = LOCAL_IMAGE_NAME or os.getenv("IMAGE_NAME")
+SPACE_BASE_URL = os.getenv("SPACE_BASE_URL", "").strip()
+ENV_MODE = os.getenv("ENV_MODE", "auto").strip().lower()
 
 BENCHMARK = "sql_surgeon"
 MAX_ACTIONS = 15 # Budget for tools + submission
 TEMPERATURE = 0.1
+
+
+async def create_environment() -> SqlSurgeonEnv:
+    """
+    Create an environment client from HF Space or local Docker image.
+
+    Modes:
+      - ENV_MODE=space  -> requires SPACE_BASE_URL
+      - ENV_MODE=docker -> requires IMAGE_NAME/LOCAL_IMAGE_NAME
+      - ENV_MODE=auto   -> prefers SPACE_BASE_URL if present, else Docker
+    """
+    if ENV_MODE == "space":
+        if not SPACE_BASE_URL:
+            raise ValueError("ENV_MODE=space requires SPACE_BASE_URL to be set.")
+        return SqlSurgeonEnv(base_url=SPACE_BASE_URL)
+
+    if ENV_MODE == "docker":
+        if not IMAGE_NAME:
+            raise ValueError("ENV_MODE=docker requires LOCAL_IMAGE_NAME or IMAGE_NAME.")
+        return await SqlSurgeonEnv.from_docker_image(IMAGE_NAME)
+
+    # auto mode
+    if SPACE_BASE_URL:
+        return SqlSurgeonEnv(base_url=SPACE_BASE_URL)
+
+    if IMAGE_NAME:
+        return await SqlSurgeonEnv.from_docker_image(IMAGE_NAME)
+
+    raise ValueError(
+        "No environment target configured. Set SPACE_BASE_URL (for HF Space) "
+        "or LOCAL_IMAGE_NAME/IMAGE_NAME (for Docker)."
+    )
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -181,7 +215,7 @@ async def main() -> None:
         score = 0.0
         env = None
         try:
-            env = await SqlSurgeonEnv.from_docker_image(IMAGE_NAME)
+            env = await create_environment()
             log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
             history = [{"role": "system", "content": SYSTEM_PROMPT}]
