@@ -103,3 +103,25 @@ class SqlSurgeonEnv(EnvClient[SqlSurgeonAction, SqlSurgeonObservation, SqlSurgeo
             best_speedup=payload.get("best_speedup", 0.0),
             cumulative_reward=payload.get("cumulative_reward", 0.0),
         )
+
+    async def step(self, action: SqlSurgeonAction, **kwargs):
+        """
+        Execute a step with backward-compatible payload fallback.
+
+        Some deployed spaces still validate against the legacy action schema:
+        {"optimized_query": "..."}.
+        """
+        try:
+            return await super().step(action, **kwargs)
+        except RuntimeError as e:
+            msg = str(e)
+            if "VALIDATION_ERROR" not in msg:
+                raise
+
+            legacy_query = str(getattr(action, "query", "") or "")
+            legacy_message = {
+                "type": "step",
+                "data": {"optimized_query": legacy_query},
+            }
+            response = await self._send_and_receive(legacy_message)
+            return self._parse_result(response.get("data", {}))
