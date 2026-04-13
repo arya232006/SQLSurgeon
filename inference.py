@@ -43,6 +43,7 @@ INFERENCE_JSON_MODE = os.getenv("INFERENCE_JSON_MODE", "").strip().lower() in ("
 BENCHMARK = "sql_surgeon"
 MAX_ACTIONS = 15 # Budget for tools + submission
 TEMPERATURE = 0.1
+FORCE_JSON_MODE = True  # Always use JSON response format to prevent LLM from reasoning in prose
 
 
 def log_remote_action_schema(base_url: str) -> None:
@@ -122,41 +123,41 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 
 # ── System Prompt ────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a Research-Grade SQL Performance Engineer.
-Your goal is to optimize a slow SQL query while ensuring 100% semantic correctness.
+SYSTEM_PROMPT = """You must output ONLY valid JSON. No markdown, no prose, no explanations.
 
-AVAILABLE ACTIONS (choose one per turn):
-1. "schema": Get full database schema and indexes. Requires NO query field.
-2. "explain": Analyze execution plan for your candidate query. Requires query field.
-3. "think": Internal reasoning (logged but doesn't run tools). Use between actions.
-4. "submit": Final answer submission. Requires query field and confidence (0.0-1.0).
+Your task: Optimize a slow SQL query to make it faster while keeping results identical.
 
-MANDATORY FIRST ACTION:
-Your FIRST action MUST be "schema" (not "think"). This shows you understand the database structure before optimizing.
+FIRST ACTION (mandatory):
+{"action_type": "schema"}
 
-EXAMPLE FIRST RESPONSE:
-{
-  "action_type": "schema",
-  "query": "",
-  "thoughts": "Starting analysis by checking database structure"
-}
+Then follow this workflow:
+1. After schema response, use "explain" to test queries
+2. Verify your optimization doesn't change results
+3. Submit the optimized query with confidence score
 
-RESPONSE FORMAT:
-- Output exactly ONE JSON object per turn
-- Keys: action_type, query (for explain/submit), thoughts (for think), confidence (for submit)
-- You may wrap it in [START]...[END] or ```json markers
+AVAILABLE ACTIONS (respond with ONE per turn):
+1. schema - Get database tables, columns, indexes
+   {"action_type": "schema"}
 
-OPTIMIZATION WORKFLOW:
-1. Call "schema" first to understand the database
-2. Call "explain" multiple times to test your candidate queries
-3. Only "submit" when confident the query is correct AND faster
-4. NEVER submit queries you haven't verified with "explain"
+2. explain - Analyze query performance
+   {"action_type": "explain", "query": "SELECT ..."}
 
-KEY RULES:
-- Semantic correctness is CRITICAL (wrong results = -1.0 penalty)
-- Deceptive hints in the task may be misleading; verify everything with "explain"
-- Always provide confidence scores (0.0-1.0) in submissions
-- You have 15 actions total; use them wisely
+3. think - Internal reasoning
+   {"action_type": "think", "thoughts": "your analysis"}
+
+4. submit - Final optimized query
+   {"action_type": "submit", "query": "SELECT ...", "confidence": 0.95}
+
+CRITICAL RULES:
+- Respond with ONLY a JSON object
+- No nested objects except what's shown above
+- action_type must be one of: schema, explain, think, submit
+- confidence must be 0.0 to 1.0
+- First response MUST have action_type = "schema"
+- Test optimizations with explain before submitting
+- Never submit without testing first
+
+RESPONSE MUST BE VALID JSON ONLY. No other text.
 """
 
 
@@ -385,36 +386,35 @@ async def get_next_action(client: OpenAI, history: List[Dict]) -> Dict:
         }
         if INFERENCE_DEBUG:
             print(f"[DEBUG] Calling LLM with {len(history)} messages, last user prompt: {history[-1]['content'][:100] if history else '(no history)'}...", flush=True)
-        if INFERENCE_JSON_MODE:
+        if INFERENCE_JSON_MODE or FORCE_JSON_MODE:
             req["response_format"] = {"type": "json_object"}
         completion = client.chat.completions.create(**req)
         message = completion.choices[0].message
         full_raw = _all_assistant_text(message)
-
-        if INFERENCE_DEBUG and not full_raw.strip():
+        
+        # ALWAYS log the LLM response for debugging
+        if not full_raw.strip():
             fr = getattr(completion.choices[0], "finish_reason", None)
             print(f"[DEBUG] Empty LLM text finish_reason={fr!r}", flush=True)
-        
-        if INFERENCE_DEBUG and full_raw:
-            preview = full_raw[:200].replace("\n", "\\n")
-            print(f"[DEBUG] LLM response preview: {preview!r}...", flush=True)
+        else:
+            preview = full_raw[:300].replace("\n", "\\n")
+            print(f"[DEBUG] LLM response: {preview!r}...", flush=True)
 
         parsed = _parse_action_from_llm_text(full_raw)
         if isinstance(parsed, dict):
             normalized = _normalize_parsed_action(parsed)
             if normalized is not None:
-                if INFERENCE_DEBUG:
-                    at = normalized.get("action_type")
-                    print(
-                        f"[DEBUG] parsed ok action_type={at!r} "
-                        f"query_len={len(str(normalized.get('query') or ''))}",
-                        flush=True,
-                    )
+                at = normalized.get("action_type")
+                print(
+                    f"[DEBUG] Parsed OK: action_type={at!r} "
+                    f"query_len={len(str(normalized.get('query') or ''))}",
+                    flush=True,
+                )
                 return normalized
 
-        if INFERENCE_DEBUG:
-            preview = full_raw[:1200].replace("\n", "\\n")
-            print(f"[DEBUG] Parse failed; full text preview: {preview!r}", flush=True)
+        print(f"[DEBUG] Parse FAILED - returning default think action", flush=True)
+        preview = full_raw[:1200].replace("\n", "\\n") if full_raw else "(empty)"
+        print(f"[DEBUG] Full LLM text: {preview!r}", flush=True)
 
 
         return {
