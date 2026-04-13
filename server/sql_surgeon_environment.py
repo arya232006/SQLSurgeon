@@ -194,6 +194,9 @@ class SqlSurgeonEnvironment(Environment):
         # Branch based on Action Type
         from models import SqlSurgeonActionType
         
+        # Normalize action type string to enum
+        a_type_str = str(a_type).strip().lower() if isinstance(a_type, str) else a_type.value
+        
         tool_result = None
         reward = 0.0
         done = False
@@ -202,21 +205,21 @@ class SqlSurgeonEnvironment(Environment):
             "actions_remaining": self._state.max_actions - self._state.actions_used,
         }
 
-        if a_type == SqlSurgeonActionType.CHECK_SCHEMA:
+        if a_type_str == "schema" or a_type == SqlSurgeonActionType.CHECK_SCHEMA:
             self._state.tool_calls_count += 1
             tool_result = self._db.get_schema_info()
             reward = 0.0
             
-        elif a_type == SqlSurgeonActionType.RUN_EXPLAIN:
+        elif a_type_str == "explain" or a_type == SqlSurgeonActionType.RUN_EXPLAIN:
             self._state.tool_calls_count += 1
             tool_result = self._db.get_query_plan(query)
             reward = 0.0
             
-        elif a_type == SqlSurgeonActionType.THINK:
+        elif a_type_str == "think" or a_type == SqlSurgeonActionType.THINK:
             tool_result = f"Reasoning logged: {len(thoughts)} characters."
             reward = 0.0
             
-        elif a_type == SqlSurgeonActionType.SUBMIT:
+        elif a_type_str == "submit" or a_type == SqlSurgeonActionType.SUBMIT:
             grade = grade_query(
                 db=self._db,
                 original_query=self._current_task.slow_query,

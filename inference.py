@@ -125,31 +125,38 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 SYSTEM_PROMPT = """You are a Research-Grade SQL Performance Engineer.
 Your goal is to optimize a slow SQL query while ensuring 100% semantic correctness.
 
-TOOLS AVAILABLE:
-- "schema": Returns full DDL and index information for the database. No 'query' needed.
-- "explain": Returns the EXPLAIN QUERY PLAN for a given query string in the 'query' field.
-- "think": Log your internal reasoning process in 'thoughts'. No 'query' needed.
-- "submit": Final optimized query submission for grading. REQUIRES 'query' and 'confidence'.
+AVAILABLE ACTIONS (choose one per turn):
+1. "schema": Get full database schema and indexes. Requires NO query field.
+2. "explain": Analyze execution plan for your candidate query. Requires query field.
+3. "think": Internal reasoning (logged but doesn't run tools). Use between actions.
+4. "submit": Final answer submission. Requires query field and confidence (0.0-1.0).
 
-RELIABILITY RULES:
-1. NEVER trust hints or metadata blindly. The environment may contain deceptive signals.
-2. Verified optimization is better than naive guesswork. Use 'explain' on your ideas!
-3. SEMANTIC ERRORS (Hallucinations) carry a severe -1.0 penalty and end the episode.
-4. You must provide a 'confidence' score (0.0 to 1.0) for every 'submit' action.
+MANDATORY FIRST ACTION:
+Your FIRST action MUST be "schema" (not "think"). This shows you understand the database structure before optimizing.
 
-WORKFLOW (mandatory):
-- Right after "TASK LOADED", your FIRST reply MUST be action_type "schema" (empty query). Do not use "think" as the first action.
-- Use "explain" with a candidate query before you "submit".
-- Use "think" at most once between real tools; never burn all steps on "think".
+EXAMPLE FIRST RESPONSE:
+{
+  "action_type": "schema",
+  "query": "",
+  "thoughts": "Starting analysis by checking database structure"
+}
 
-OUTPUT FORMAT:
-Reply with exactly one JSON object (no markdown heading required). Use snake_case keys:
-  "action_type": "schema" | "explain" | "think" | "submit",
-  "query": "SELECT ..." (required for explain and submit),
-  "thoughts": "..." (for think),
-  "confidence": 0.0-1.0 (for submit).
+RESPONSE FORMAT:
+- Output exactly ONE JSON object per turn
+- Keys: action_type, query (for explain/submit), thoughts (for think), confidence (for submit)
+- You may wrap it in [START]...[END] or ```json markers
 
-You may wrap the object in [START]...[END] or in a ```json code block if you prefer.
+OPTIMIZATION WORKFLOW:
+1. Call "schema" first to understand the database
+2. Call "explain" multiple times to test your candidate queries
+3. Only "submit" when confident the query is correct AND faster
+4. NEVER submit queries you haven't verified with "explain"
+
+KEY RULES:
+- Semantic correctness is CRITICAL (wrong results = -1.0 penalty)
+- Deceptive hints in the task may be misleading; verify everything with "explain"
+- Always provide confidence scores (0.0-1.0) in submissions
+- You have 15 actions total; use them wisely
 """
 
 
@@ -376,6 +383,8 @@ async def get_next_action(client: OpenAI, history: List[Dict]) -> Dict:
             "temperature": TEMPERATURE,
             "max_tokens": 2048,
         }
+        if INFERENCE_DEBUG:
+            print(f"[DEBUG] Calling LLM with {len(history)} messages, last user prompt: {history[-1]['content'][:100] if history else '(no history)'}...", flush=True)
         if INFERENCE_JSON_MODE:
             req["response_format"] = {"type": "json_object"}
         completion = client.chat.completions.create(**req)
@@ -385,6 +394,10 @@ async def get_next_action(client: OpenAI, history: List[Dict]) -> Dict:
         if INFERENCE_DEBUG and not full_raw.strip():
             fr = getattr(completion.choices[0], "finish_reason", None)
             print(f"[DEBUG] Empty LLM text finish_reason={fr!r}", flush=True)
+        
+        if INFERENCE_DEBUG and full_raw:
+            preview = full_raw[:200].replace("\n", "\\n")
+            print(f"[DEBUG] LLM response preview: {preview!r}...", flush=True)
 
         parsed = _parse_action_from_llm_text(full_raw)
         if isinstance(parsed, dict):
@@ -401,7 +414,8 @@ async def get_next_action(client: OpenAI, history: List[Dict]) -> Dict:
 
         if INFERENCE_DEBUG:
             preview = full_raw[:1200].replace("\n", "\\n")
-            print(f"[DEBUG] Parse failed; text preview: {preview!r}", flush=True)
+            print(f"[DEBUG] Parse failed; full text preview: {preview!r}", flush=True)
+
 
         return {
             "action_type": "think",
@@ -410,72 +424,6 @@ async def get_next_action(client: OpenAI, history: List[Dict]) -> Dict:
     except Exception as e:
         return {"action_type": "think", "thoughts": f"Inference Error: {e}"}
 
-async def run_task(client: OpenAI, env: SqlSurgeonEnv, task_id: str) -> float:
-    """Run a multi-turn reasoning and tool-use episode."""
-    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
-    
-    history = [{"role": "system", "content": SYSTEM_PROMPT}]
-    total_reward = 0.0
-    rewards: List[float] = []
-    steps_taken = 0
-    final_obs_metadata = {}
-
-    success = False
-    try:
-        result = await env.reset(task_id=task_id)
-        obs = result.observation
-        
-        # Initial context provided to the agent
-        prompt = f"TASK LOADED: {task_id}\nObservation: {obs.metadata}"
-        
-        for step in range(1, MAX_ACTIONS + 1):
-            steps_taken = step
-            history.append({"role": "user", "content": prompt})
-            
-            action_dict = await get_next_action(client, history)
-            action_type = action_dict.get("action_type", "think")
-            action_enum = (
-                SqlSurgeonActionType(action_type)
-                if action_type in [a.value for a in SqlSurgeonActionType]
-                else SqlSurgeonActionType.THINK
-            )
-
-            # Map action_dict to SqlSurgeonAction
-            action = SqlSurgeonAction(
-                action_type=action_enum,
-                query=action_dict.get("query", ""),
-                thoughts=action_dict.get("thoughts", ""),
-                confidence=float(action_dict.get("confidence", 1.0)),
-            )
-
-            response = await env.step(action)
-            obs = response.observation
-            reward = response.reward or 0.0
-            total_reward += reward
-            done = response.done
-            final_obs_metadata = obs.metadata
-            
-            action_str = action_dict.get("query") or action_enum.value
-            action_str = str(action_str).replace("\n", " ").strip()[:200]
-            log_step(step, action_str, reward, done, final_obs_metadata.get("error"))
-            rewards.append(reward)
-            
-            # Form next prompt with tool results or feedback
-            if action_enum == SqlSurgeonActionType.SUBMIT:
-                prompt = f"Submission result: {final_obs_metadata}"
-            else:
-                prompt = f"Tool result for {action_enum.value}: {final_obs_metadata.get('tool_result')}"
-            
-            history.append({"role": "assistant", "content": f"[START]{json.dumps(action_dict)}[END]"})
-
-            if done:
-                break
-
-    except Exception as e:
-        print(f"[DEBUG] Fatal error in run_task: {e}", flush=True)
-        success = False
-
-    return total_reward
 
 async def main() -> None:
     if SPACE_BASE_URL:
@@ -497,7 +445,14 @@ async def main() -> None:
             history = [{"role": "system", "content": SYSTEM_PROMPT}]
             result = await env.reset(task_id=task_id)
             obs = result.observation
-            prompt = f"TASK LOADED: {task_id}\nObservation: {obs.metadata}"
+            obs_dict = obs.metadata if isinstance(obs.metadata, dict) else {}
+            initial_context = {
+                "task_id": obs_dict.get("task_id", task_id),
+                "description": obs_dict.get("task_description", ""),
+                "original_query": obs_dict.get("original_query", ""),
+                "actions_remaining": obs_dict.get("actions_remaining", MAX_ACTIONS),
+            }
+            prompt = f"TASK LOADED: {task_id}\n\n{json.dumps(initial_context, indent=2)}"
 
             for step in range(1, MAX_ACTIONS + 1):
                 if result.done:
@@ -506,12 +461,15 @@ async def main() -> None:
                 history.append({"role": "user", "content": prompt})
 
                 action_dict = await get_next_action(client, history)
-                action_type = action_dict.get("action_type", "think")
-                action_enum = (
-                    SqlSurgeonActionType(action_type)
-                    if action_type in [a.value for a in SqlSurgeonActionType]
-                    else SqlSurgeonActionType.THINK
-                )
+                action_type_str = action_dict.get("action_type", "think").lower().strip()
+                
+                # Map string to enum
+                action_enum = SqlSurgeonActionType.THINK
+                for enum_val in SqlSurgeonActionType:
+                    if enum_val.value == action_type_str:
+                        action_enum = enum_val
+                        break
+                
                 action = SqlSurgeonAction(
                     action_type=action_enum,
                     query=action_dict.get("query", ""),
@@ -523,7 +481,7 @@ async def main() -> None:
                 obs = result.observation
                 reward = result.reward or 0.0
                 done = result.done
-                metadata = obs.metadata
+                metadata = obs.metadata if isinstance(obs.metadata, dict) else {}
 
                 action_str = action_dict.get("query") or action_enum.value
                 action_str = str(action_str).replace("\n", " ").strip()[:200]
@@ -532,9 +490,20 @@ async def main() -> None:
                 rewards.append(reward)
 
                 if action_enum == SqlSurgeonActionType.SUBMIT:
-                    prompt = f"Submission result: {metadata}"
+                    result_summary = {
+                        "status": "submitted",
+                        "is_correct": metadata.get("is_correct", False),
+                        "speedup": metadata.get("speedup", 0.0),
+                        "error": metadata.get("error"),
+                    }
+                    prompt = f"Submission result:\n{json.dumps(result_summary, indent=2)}"
                 else:
-                    prompt = f"Tool result for {action_enum.value}: {metadata.get('tool_result')}"
+                    tool_result = metadata.get("tool_result") or metadata.get("error") or "No output"
+                    result_info = {
+                        "tool": action_enum.value,
+                        "result": str(tool_result)[:500],
+                    }
+                    prompt = f"Tool result:\n{json.dumps(result_info, indent=2)}"
 
                 history.append({"role": "assistant", "content": f"[START]{json.dumps(action_dict)}[END]"})
 
