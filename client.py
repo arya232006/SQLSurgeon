@@ -45,7 +45,7 @@ class SqlSurgeonEnv(EnvClient[SqlSurgeonAction, SqlSurgeonObservation, SqlSurgeo
             "confidence": action.confidence,
         }
 
-    def _parse_result(self, payload: dict) -> StepResult[SqlSurgeonObservation]:
+    def _parse_result(self, payload: dict) -> StepResult:
         # Wire format: { "observation": { ...typed fields... }, "reward", "done" }.
         # `metadata` is omitted from JSON by OpenEnv's serializer; fields live under "observation".
         inner = dict(payload.get("observation") or {})
