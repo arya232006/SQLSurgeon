@@ -13,6 +13,8 @@ _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
+from fastapi.responses import RedirectResponse
+
 from models import SqlSurgeonAction, SqlSurgeonObservation
 
 try:
@@ -30,6 +32,12 @@ app = create_app(
     SqlSurgeonObservation,
     env_name="sql_surgeon",
 )
+
+
+@app.get("/")
+def _root() -> RedirectResponse:
+    # Hugging Face Spaces loads `/`; OpenEnv’s HTTP API has no handler there by default.
+    return RedirectResponse(url="/docs")
 
 
 def main():
