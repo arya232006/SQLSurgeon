@@ -17,8 +17,8 @@ STDOUT FORMAT:
 import asyncio
 import json
 import os
-import textwrap
-from typing import List, Optional, Dict
+import re
+from typing import Any, List, Optional, Dict
 
 from openai import OpenAI
 from models import SqlSurgeonAction, SqlSurgeonActionType
@@ -46,7 +46,8 @@ def log_remote_action_schema(base_url: str) -> None:
     try:
         import requests
 
-        url = base_url.rstrip("/") + "/metadata"
+        # OpenEnv exposes action/observation JSON Schema on `/schema`, not `/metadata`.
+        url = base_url.rstrip("/") + "/schema"
         r = requests.get(url, timeout=45)
         r.raise_for_status()
         data = r.json()
@@ -144,6 +145,47 @@ Your response must contain a single JSON block wrapped in [START] and [END] mark
 [END]
 """
 
+
+def _parse_action_from_llm_text(content: str) -> Optional[Dict[str, Any]]:
+    """
+    Extract a JSON action object from model output.
+
+    Models often ignore [START]/[END] and return fenced ```json blocks or a bare object.
+    """
+    text = (content or "").strip()
+    if not text:
+        return None
+
+    if "[START]" in text and "[END]" in text:
+        chunk = text.split("[START]", 1)[1].split("[END]", 1)[0].strip()
+        try:
+            return json.loads(chunk)
+        except json.JSONDecodeError:
+            pass
+
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+    if fence:
+        try:
+            return json.loads(fence.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    start = text.find("{")
+    if start >= 0:
+        depth = 0
+        for i, ch in enumerate(text[start:], start=start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start : i + 1])
+                    except json.JSONDecodeError:
+                        break
+    return None
+
+
 async def get_next_action(client: OpenAI, history: List[Dict]) -> Dict:
     """Call the LLM to get the next action in the multi-turn loop."""
     try:
@@ -154,13 +196,16 @@ async def get_next_action(client: OpenAI, history: List[Dict]) -> Dict:
             max_tokens=2048,
         )
         content = completion.choices[0].message.content or ""
-        
-        if "[START]" in content and "[END]" in content:
-            json_str = content.split("[START]")[1].split("[END]")[0].strip()
-            return json.loads(json_str)
-        
+
+        parsed = _parse_action_from_llm_text(content)
+        if isinstance(parsed, dict) and parsed.get("action_type") is not None:
+            return parsed
+
         # Fallback to think if format is wrong
-        return {"action_type": "think", "thoughts": f"Parsing error in LLM output: {content[:100]}"}
+        return {
+            "action_type": "think",
+            "thoughts": f"Parsing error in LLM output: {content[:500]}",
+        }
     except Exception as e:
         return {"action_type": "think", "thoughts": f"Inference Error: {e}"}
 
