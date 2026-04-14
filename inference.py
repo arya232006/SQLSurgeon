@@ -123,19 +123,35 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 
 # ── System Prompt ────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """Only output valid JSON. Nothing else.
+SYSTEM_PROMPT = """You are an expert SQL query optimizer for SQLite. Your job: rewrite a slow query so it returns IDENTICAL rows but runs faster.
 
-{"action_type":"schema"}
-
-That is your first message. No thinking, no explanation, no other text.
+You MUST respond with exactly ONE JSON object per turn. No markdown, no prose, no explanation — just the JSON.
 
 Available actions:
-{"action_type":"schema"} - get database info
-{"action_type":"explain","query":"SELECT ..."} - test a query  
-{"action_type":"think","thoughts":"..."} - reason
-{"action_type":"submit","query":"SELECT ...","confidence":0.9} - final answer
 
-Always respond with ONLY the JSON object. No markdown. No text outside JSON.
+  {"action_type":"schema"}
+      → Returns table definitions, column types, and available indexes.
+
+  {"action_type":"explain","query":"<your SQL>"}
+      → Runs EXPLAIN QUERY PLAN on <your SQL> so you can verify it uses indexes.
+
+  {"action_type":"submit","query":"<your optimized SQL>","confidence":0.95}
+      → Submits your final answer. The query MUST return the exact same rows.
+        confidence is your estimate of correctness (0.0–1.0).
+
+Rules:
+- Your optimized query MUST produce exactly the same result set as the original.
+- Common wins: explicit JOINs instead of implicit, push WHERE into subqueries, replace correlated subqueries with JOINs, use window functions, leverage indexes.
+- Hints provided with the task may be DECEPTIVE. Always verify with "explain".
+- You have limited actions. Be efficient: analyze → explain → submit.
+
+Example conversation:
+  User: [task with slow query]
+  You: {"action_type":"explain","query":"SELECT o.id ...optimized... ORDER BY o.total_amount DESC"}
+  User: [explain plan result]
+  You: {"action_type":"submit","query":"SELECT o.id ...optimized... ORDER BY o.total_amount DESC","confidence":0.95}
+
+Now respond with your first JSON action.
 """
 
 
@@ -353,6 +369,45 @@ def _parse_action_from_llm_text(content: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _extract_sql_from_text(text: str) -> Optional[str]:
+    """
+    Try to extract a SELECT statement from free-form text (e.g. LLM thoughts).
+
+    Returns the longest SELECT statement found, or None.
+    """
+    if not text:
+        return None
+
+    # Look for SELECT ... ; patterns
+    matches = re.findall(
+        r'(SELECT\s[\s\S]*?;)',
+        text,
+        re.IGNORECASE,
+    )
+    if matches:
+        # Return the longest match (most likely the full query)
+        return max(matches, key=len).strip()
+
+    # Try to find SELECT without trailing semicolon (grab until end or next action keyword)
+    m = re.search(
+        r'(SELECT\s[\s\S]{20,})',
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        sql = m.group(1).strip()
+        # Trim trailing prose after the query ends
+        # Look for common sentence endings after SQL
+        for marker in ['\n\n', '\nThis ', '\nThe ', '\nI ', '\nNote']:
+            idx = sql.find(marker)
+            if idx > 30:
+                sql = sql[:idx].strip()
+                break
+        return sql
+
+    return None
+
+
 async def get_next_action(client: OpenAI, history: List[Dict]) -> Dict:
     """Call the LLM to get the next action in the multi-turn loop."""
     try:
@@ -392,17 +447,14 @@ async def get_next_action(client: OpenAI, history: List[Dict]) -> Dict:
                 )
                 return normalized
 
-        print(f"[DEBUG] Parse FAILED - returning default think action", flush=True)
+        print(f"[DEBUG] Parse FAILED - returning default schema action", flush=True)
         preview = full_raw[:1200].replace("\n", "\\n") if full_raw else "(empty)"
         print(f"[DEBUG] Full LLM text: {preview!r}", flush=True)
 
-
-        return {
-            "action_type": "think",
-            "thoughts": f"Parsing error in LLM output: {full_raw[:500]}",
-        }
+        # Instead of defaulting to think (which loops), default to schema
+        return {"action_type": "schema"}
     except Exception as e:
-        return {"action_type": "think", "thoughts": f"Inference Error: {e}"}
+        return {"action_type": "schema"}
 
 
 async def main() -> None:
@@ -426,13 +478,47 @@ async def main() -> None:
             result = await env.reset(task_id=task_id)
             obs = result.observation
             obs_dict = obs.metadata if isinstance(obs.metadata, dict) else {}
-            initial_context = {
-                "task_id": obs_dict.get("task_id", task_id),
-                "description": obs_dict.get("task_description", ""),
-                "original_query": obs_dict.get("original_query", ""),
-                "actions_remaining": obs_dict.get("actions_remaining", MAX_ACTIONS),
-            }
-            prompt = f"TASK LOADED: {task_id}\n\n{json.dumps(initial_context, indent=2)}"
+
+            # Build rich initial context with ALL available observation data
+            task_desc = obs_dict.get("task_description", "")
+            original_query = obs_dict.get("original_query", "")
+            schema_ddl = obs_dict.get("schema_ddl", "")
+            sample_data = obs_dict.get("sample_data", "")
+            query_plan = obs_dict.get("query_plan_original", "")
+            exec_time = obs_dict.get("execution_time_original_ms", 0)
+            row_count = obs_dict.get("expected_row_count", 0)
+            hints = obs_dict.get("deceptive_hints", [])
+            actions_left = obs_dict.get("actions_remaining", MAX_ACTIONS)
+
+            prompt_parts = [
+                f"=== TASK: {task_id} ===",
+                f"Description: {task_desc}",
+                f"",
+                f"--- ORIGINAL SLOW QUERY ---",
+                original_query,
+                f"",
+                f"Execution time: {exec_time}ms | Rows returned: {row_count}",
+                f"",
+                f"--- DATABASE SCHEMA ---",
+                schema_ddl,
+                f"",
+                f"--- ORIGINAL QUERY PLAN ---",
+                query_plan,
+                f"",
+            ]
+            if hints:
+                prompt_parts.append("--- HINTS (may be deceptive — verify empirically!) ---")
+                for h in hints:
+                    prompt_parts.append(f"  • {h}")
+                prompt_parts.append("")
+            prompt_parts.append(f"Actions remaining: {actions_left}")
+            prompt_parts.append("")
+            prompt_parts.append("Analyze the query and schema, then optimize. Respond with a JSON action.")
+            prompt = "\n".join(prompt_parts)
+
+            # Track thinks to force-convert them into real actions
+            consecutive_thinks = 0
+            has_fetched_schema = False
 
             for step in range(1, MAX_ACTIONS + 1):
                 if result.done:
@@ -441,7 +527,7 @@ async def main() -> None:
                 history.append({"role": "user", "content": prompt})
 
                 action_dict = await get_next_action(client, history)
-                action_type_str = action_dict.get("action_type", "think").lower().strip()
+                action_type_str = action_dict.get("action_type", "schema").lower().strip()
                 
                 # Map string to enum
                 action_enum = SqlSurgeonActionType.THINK
@@ -449,7 +535,54 @@ async def main() -> None:
                     if enum_val.value == action_type_str:
                         action_enum = enum_val
                         break
-                
+
+                # ── Force-convert THINK into real actions ──
+                if action_enum == SqlSurgeonActionType.THINK:
+                    consecutive_thinks += 1
+                    thoughts = action_dict.get("thoughts", "")
+                    
+                    # Try to extract SQL from the thoughts
+                    extracted_sql = _extract_sql_from_text(thoughts)
+                    
+                    if extracted_sql and consecutive_thinks >= 2:
+                        # Force submit with extracted SQL
+                        print(f"[DEBUG] Force-converting think→submit with extracted SQL ({len(extracted_sql)} chars)", flush=True)
+                        action_dict = {"action_type": "submit", "query": extracted_sql, "confidence": 0.8}
+                        action_enum = SqlSurgeonActionType.SUBMIT
+                    elif not has_fetched_schema:
+                        # First think → convert to schema fetch
+                        print(f"[DEBUG] Force-converting think→schema", flush=True)
+                        action_dict = {"action_type": "schema"}
+                        action_enum = SqlSurgeonActionType.CHECK_SCHEMA
+                    elif extracted_sql:
+                        # Have schema, have SQL in thoughts → explain it
+                        print(f"[DEBUG] Force-converting think→explain with extracted SQL", flush=True)
+                        action_dict = {"action_type": "explain", "query": extracted_sql}
+                        action_enum = SqlSurgeonActionType.RUN_EXPLAIN
+                    else:
+                        # Can't extract SQL, allow one think then force explain with original
+                        if consecutive_thinks >= 2:
+                            print(f"[DEBUG] Force-converting think→explain with original query", flush=True)
+                            action_dict = {"action_type": "explain", "query": original_query}
+                            action_enum = SqlSurgeonActionType.RUN_EXPLAIN
+                        else:
+                            # Allow one think: record it locally and continue
+                            log_step(step=step, action="think", reward=0.0, done=False, error=None)
+                            rewards.append(0.0)
+                            history.append({"role": "assistant", "content": json.dumps(action_dict)})
+                            prompt = (
+                                f"Now respond with a concrete action. "
+                                f"Use {{\"action_type\":\"explain\",\"query\":\"<your optimized SQL>\"}} "
+                                f"or {{\"action_type\":\"submit\",\"query\":\"<your optimized SQL>\",\"confidence\":0.9}}"
+                            )
+                            continue
+                else:
+                    consecutive_thinks = 0
+
+                # Track schema fetches
+                if action_enum == SqlSurgeonActionType.CHECK_SCHEMA:
+                    has_fetched_schema = True
+
                 action = SqlSurgeonAction(
                     action_type=action_enum,
                     query=action_dict.get("query", ""),
@@ -469,6 +602,9 @@ async def main() -> None:
                 log_step(step=step, action=action_str, reward=reward, done=done, error=error_val)
                 rewards.append(reward)
 
+                # Build next prompt with rich observation data
+                history.append({"role": "assistant", "content": json.dumps(action_dict)})
+
                 if action_enum == SqlSurgeonActionType.SUBMIT:
                     result_summary = {
                         "status": "submitted",
@@ -477,15 +613,23 @@ async def main() -> None:
                         "error": metadata.get("error"),
                     }
                     prompt = f"Submission result:\n{json.dumps(result_summary, indent=2)}"
+                elif action_enum == SqlSurgeonActionType.CHECK_SCHEMA:
+                    tool_result = metadata.get("tool_result") or "No schema data returned"
+                    prompt = (
+                        f"Schema info:\n{str(tool_result)[:2000]}\n\n"
+                        f"Now write an optimized version of the original query and submit it. "
+                        f"Respond with: {{\"action_type\":\"explain\",\"query\":\"<your optimized SQL>\"}}"
+                    )
+                elif action_enum == SqlSurgeonActionType.RUN_EXPLAIN:
+                    tool_result = metadata.get("tool_result") or "No plan data returned"
+                    prompt = (
+                        f"EXPLAIN QUERY PLAN result:\n{str(tool_result)[:2000]}\n\n"
+                        f"Actions remaining: {metadata.get('actions_remaining', '?')}.\n"
+                        f"Submit now: {{\"action_type\":\"submit\",\"query\":\"<your optimized SQL>\",\"confidence\":0.95}}"
+                    )
                 else:
                     tool_result = metadata.get("tool_result") or metadata.get("error") or "No output"
-                    result_info = {
-                        "tool": action_enum.value,
-                        "result": str(tool_result)[:500],
-                    }
-                    prompt = f"Tool result:\n{json.dumps(result_info, indent=2)}"
-
-                history.append({"role": "assistant", "content": f"[START]{json.dumps(action_dict)}[END]"})
+                    prompt = f"Result: {str(tool_result)[:1000]}\nRespond with a JSON action."
 
                 if done:
                     break
