@@ -33,3 +33,6 @@ py-modules = ["client", "models", "inference"]
 
 [tool.setuptools.packages.find]
 include = ["server*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

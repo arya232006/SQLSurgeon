@@ -173,6 +173,42 @@ pip install -e .
 uvicorn server.app:app --host 0.0.0.0 --port 8000
 ```
 
+### Tester Quickstart (no clone required)
+
+If you are evaluating this environment with your own agent stack, you can use the hosted Space directly:
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/arya232006/SQLSurgeon/blob/main/examples/tester_colab.ipynb)
+
+- Base URL: `https://aryadeep232006-sqlsurgeon.hf.space`
+- Browser UI (if enabled): `https://aryadeep232006-sqlsurgeon.hf.space/web`
+- Swagger docs: `https://aryadeep232006-sqlsurgeon.hf.space/docs`
+- OpenAPI spec: `https://aryadeep232006-sqlsurgeon.hf.space/openapi.json`
+
+Minimal flow:
+1. `POST /reset` to start an episode and receive an initial observation.
+2. `POST /step` repeatedly with payload shape `{"action": {...}}`.
+3. `GET /state` to inspect current episode metadata anytime.
+
+Example request:
+
+```bash
+curl -X POST "https://aryadeep232006-sqlsurgeon.hf.space/step" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": {
+      "action_type": "think",
+      "query": "",
+      "thoughts": "Analyze schema and plan before submitting."
+    }
+  }'
+```
+
+More copy-paste examples:
+- `examples/tester_curl.sh`
+- `examples/tester_python.py`
+- `examples/tester_js.mjs`
+- `examples/tester_colab.ipynb`
+
 ### Use the environment
 
 ```python
@@ -263,6 +299,7 @@ sql_surgeon/
 | `HF_TOKEN` | Yes | — | HuggingFace API key |
 | `LOCAL_IMAGE_NAME` | Yes* | — | Local docker image for `from_docker_image(...)` |
 | `IMAGE_NAME` | No | — | Backward-compatible alias for local image name |
+| `ENABLE_WEB_INTERFACE` | No | `false` | If `true`, serves OpenEnv browser UI at `/web` |
 
 \*Required when running baseline locally from docker image.
 

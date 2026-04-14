@@ -5,6 +5,8 @@ SQL Surgeon — Typed Models.
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from pydantic import Field
+
 try:
     from openenv.core.env_server.types import Action, Observation, State
 except Exception:
@@ -17,7 +19,7 @@ except Exception:
     class Observation(BaseModel):
         done: bool = False
         reward: float = 0.0
-        metadata: Dict[str, Any] = {}
+        metadata: Dict[str, Any] = Field(default_factory=dict)
 
     class State(BaseModel):
         pass
@@ -47,7 +49,7 @@ class SqlSurgeonObservation(Observation):
     query_plan_original: str = ""
     execution_time_original_ms: float = 0.0
     expected_row_count: int = 0
-    deceptive_hints: List[str] = []
+    deceptive_hints: List[str] = Field(default_factory=list)
 
     tool_result: Optional[str] = None
     last_error: Optional[str] = None
@@ -73,4 +75,4 @@ class SqlSurgeonState(State):
     total_confidence_error: float = 0.0
     tool_calls_count: int = 0
     deception_ignored: bool = False
-    attempt_history: List[str] = []
+    attempt_history: List[str] = Field(default_factory=list)

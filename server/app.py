@@ -62,8 +62,15 @@ def custom_redoc() -> object:
 
 @app.get("/")
 def _root() -> RedirectResponse:
-    # Hugging Face Spaces loads `/`; OpenEnv’s HTTP API has no handler there by default.
-    return RedirectResponse(url="docs")
+    # Hugging Face Spaces loads `/`; redirect testers to the most useful UI.
+    # When the OpenEnv web interface is enabled, send users to `/web`.
+    # Otherwise, default to Swagger docs.
+    enable_web = os.getenv("ENABLE_WEB_INTERFACE", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+    return RedirectResponse(url="web" if enable_web else "docs")
 
 
 def main():
