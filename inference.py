@@ -454,7 +454,8 @@ async def get_next_action(client: OpenAI, history: List[Dict]) -> Dict:
         # Instead of defaulting to think (which loops), default to schema
         return {"action_type": "schema"}
     except Exception as e:
-        return {"action_type": "schema"}
+        print(f"[ERROR] LLM API call failed: {type(e).__name__}: {e}", flush=True)
+        return {"action_type": "schema", "_error": str(e)}
 
 
 async def main() -> None:
@@ -462,6 +463,24 @@ async def main() -> None:
         log_remote_action_schema(SPACE_BASE_URL)
 
     client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+
+    # ── Upfront LLM API health check ──
+    print(f"[INFO] LLM endpoint: {API_BASE_URL} model: {MODEL_NAME}", flush=True)
+    try:
+        test_resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "Reply with: {\"status\":\"ok\"}"}],
+            temperature=0.0,
+            max_tokens=32,
+            response_format={"type": "json_object"},
+        )
+        test_content = test_resp.choices[0].message.content or ""
+        print(f"[INFO] LLM health check OK: {test_content[:100]}", flush=True)
+    except Exception as e:
+        print(f"[FATAL] LLM API unreachable: {type(e).__name__}: {e}", flush=True)
+        print(f"[FATAL] Check HF_TOKEN permissions — token needs 'Make calls to Inference Providers' scope.", flush=True)
+        raise SystemExit(1)
+
     tasks_to_test = ["filter_scan", "index_trap", "semantics_hazard", "explain_deception"]
 
     for task_id in tasks_to_test:
