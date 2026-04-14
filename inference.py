@@ -43,7 +43,7 @@ INFERENCE_JSON_MODE = os.getenv("INFERENCE_JSON_MODE", "").strip().lower() in ("
 BENCHMARK = "sql_surgeon"
 MAX_ACTIONS = 15 # Budget for tools + submission
 TEMPERATURE = 0.1
-FORCE_JSON_MODE = True  # Always use JSON response format to prevent LLM from reasoning in prose
+FORCE_JSON_MODE = False  # HF Inference API does not support response_format for all models
 
 
 def log_remote_action_schema(base_url: str) -> None:
@@ -421,7 +421,16 @@ async def get_next_action(client: OpenAI, history: List[Dict]) -> Dict:
             print(f"[DEBUG] Calling LLM with {len(history)} messages, last user prompt: {history[-1]['content'][:100] if history else '(no history)'}...", flush=True)
         if INFERENCE_JSON_MODE or FORCE_JSON_MODE:
             req["response_format"] = {"type": "json_object"}
-        completion = client.chat.completions.create(**req)
+        # Try the request; if response_format causes 400, retry without it
+        try:
+            completion = client.chat.completions.create(**req)
+        except Exception as first_err:
+            if "response_format" in req and "400" in str(first_err) or "invalid_request" in str(first_err).lower():
+                req.pop("response_format", None)
+                print(f"[DEBUG] Retrying LLM call without response_format", flush=True)
+                completion = client.chat.completions.create(**req)
+            else:
+                raise first_err
         message = completion.choices[0].message
         full_raw = _all_assistant_text(message)
         
@@ -469,16 +478,15 @@ async def main() -> None:
     try:
         test_resp = client.chat.completions.create(
             model=MODEL_NAME,
-            messages=[{"role": "user", "content": "Reply with: {\"status\":\"ok\"}"}],
+            messages=[{"role": "user", "content": "Say hello in one word."}],
             temperature=0.0,
             max_tokens=32,
-            response_format={"type": "json_object"},
         )
         test_content = test_resp.choices[0].message.content or ""
-        print(f"[INFO] LLM health check OK: {test_content[:100]}", flush=True)
+        print(f"[INFO] LLM health check OK: {test_content[:100]!r}", flush=True)
     except Exception as e:
         print(f"[FATAL] LLM API unreachable: {type(e).__name__}: {e}", flush=True)
-        print(f"[FATAL] Check HF_TOKEN permissions — token needs 'Make calls to Inference Providers' scope.", flush=True)
+        print(f"[FATAL] Check HF_TOKEN permissions and API_BASE_URL.", flush=True)
         raise SystemExit(1)
 
     tasks_to_test = ["filter_scan", "index_trap", "semantics_hazard", "explain_deception"]
