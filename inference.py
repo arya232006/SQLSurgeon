@@ -123,41 +123,19 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 
 # ── System Prompt ────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You must output ONLY valid JSON. No markdown, no prose, no explanations.
+SYSTEM_PROMPT = """Only output valid JSON. Nothing else.
 
-Your task: Optimize a slow SQL query to make it faster while keeping results identical.
+{"action_type":"schema"}
 
-FIRST ACTION (mandatory):
-{"action_type": "schema"}
+That is your first message. No thinking, no explanation, no other text.
 
-Then follow this workflow:
-1. After schema response, use "explain" to test queries
-2. Verify your optimization doesn't change results
-3. Submit the optimized query with confidence score
+Available actions:
+{"action_type":"schema"} - get database info
+{"action_type":"explain","query":"SELECT ..."} - test a query  
+{"action_type":"think","thoughts":"..."} - reason
+{"action_type":"submit","query":"SELECT ...","confidence":0.9} - final answer
 
-AVAILABLE ACTIONS (respond with ONE per turn):
-1. schema - Get database tables, columns, indexes
-   {"action_type": "schema"}
-
-2. explain - Analyze query performance
-   {"action_type": "explain", "query": "SELECT ..."}
-
-3. think - Internal reasoning
-   {"action_type": "think", "thoughts": "your analysis"}
-
-4. submit - Final optimized query
-   {"action_type": "submit", "query": "SELECT ...", "confidence": 0.95}
-
-CRITICAL RULES:
-- Respond with ONLY a JSON object
-- No nested objects except what's shown above
-- action_type must be one of: schema, explain, think, submit
-- confidence must be 0.0 to 1.0
-- First response MUST have action_type = "schema"
-- Test optimizations with explain before submitting
-- Never submit without testing first
-
-RESPONSE MUST BE VALID JSON ONLY. No other text.
+Always respond with ONLY the JSON object. No markdown. No text outside JSON.
 """
 
 
@@ -393,6 +371,8 @@ async def get_next_action(client: OpenAI, history: List[Dict]) -> Dict:
         full_raw = _all_assistant_text(message)
         
         # ALWAYS log the LLM response for debugging
+        print(f"[DEBUG_RESPONSE] {full_raw[:500]!r}", flush=True)
+        
         if not full_raw.strip():
             fr = getattr(completion.choices[0], "finish_reason", None)
             print(f"[DEBUG] Empty LLM text finish_reason={fr!r}", flush=True)
