@@ -13,6 +13,7 @@ _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import RedirectResponse
 
 from models import SqlSurgeonAction, SqlSurgeonObservation
@@ -33,11 +34,36 @@ app = create_app(
     env_name="sql_surgeon",
 )
 
+# FastAPI's default docs use absolute `/openapi.json`, which breaks when the app is
+# served behind a path prefix (for example, HF Spaces embedded proxy routes).
+# Re-register docs endpoints with relative spec URLs so they work in both contexts.
+app.router.routes = [
+    route
+    for route in app.router.routes
+    if route.path not in {"/docs", "/redoc"}
+]
+
+
+@app.get("/docs", include_in_schema=False)
+def custom_swagger_ui() -> object:
+    return get_swagger_ui_html(
+        openapi_url="openapi.json",
+        title=f"{app.title} - Swagger UI",
+    )
+
+
+@app.get("/redoc", include_in_schema=False)
+def custom_redoc() -> object:
+    return get_redoc_html(
+        openapi_url="openapi.json",
+        title=f"{app.title} - ReDoc",
+    )
+
 
 @app.get("/")
 def _root() -> RedirectResponse:
     # Hugging Face Spaces loads `/`; OpenEnv’s HTTP API has no handler there by default.
-    return RedirectResponse(url="/docs")
+    return RedirectResponse(url="docs")
 
 
 def main():
