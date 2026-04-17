@@ -73,7 +73,7 @@ After each `step()`, the agent also receives:
 | `attempts_remaining` | int | Steps left in the episode |
 | `best_speedup_so_far` | float | Best speedup across all attempts |
 
-### State
+### State.
 
 ```python
 @dataclass
