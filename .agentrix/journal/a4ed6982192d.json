@@ -1,0 +1,13 @@
+{
+  "id": "a4ed6982192d",
+  "workspace": "/data/workspaces/arya232006/SQLSurgeon",
+  "ops": [
+    {
+      "kind": "create",
+      "path": "hello.md",
+      "before_blob_path": null,
+      "after_preview": "hi",
+      "ts": 1780154385615
+    }
+  ]
+}
